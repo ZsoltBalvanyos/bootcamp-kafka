@@ -9,28 +9,73 @@ import ciris.syntax._
 import ciris.{env, loadConfig, prop}
 import com.ovoenergy.bootcamp.kafka.service.acquisition.AcquisitionService.AcquisitionRepository
 import com.ovoenergy.bootcamp.kafka.common.config._
+import com.ovoenergy.bootcamp.kafka.domain.{Acquisition, CreateAcquisition}
+import org.apache.kafka.clients.producer._
+import org.apache.kafka.common.serialization.StringSerializer
 import org.slf4j.LoggerFactory
 
-import scala.concurrent.{Await, ExecutionContext}
+import scala.concurrent.{Await, ExecutionContext, Future, Promise}
 import scala.concurrent.duration.Duration
 import scala.io.StdIn
 import scala.util.{Failure, Success}
+import scala.collection.JavaConverters._
+import scala.concurrent.Future
 
 object Main extends App {
 
   val log = LoggerFactory.getLogger(getClass)
 
+  type Key = String
+  type Value = String
+  def kafkaEndpointHC: String = s"127.0.0.1:9092"
+
+  val producer = new KafkaProducer[Key, Value](
+    Map[String, AnyRef](
+      ProducerConfig.BOOTSTRAP_SERVERS_CONFIG -> kafkaEndpointHC,
+      ProducerConfig.ACKS_CONFIG->"all",
+      ProducerConfig.MAX_IN_FLIGHT_REQUESTS_PER_CONNECTION->"1",
+      ProducerConfig.CLIENT_ID_CONFIG -> "KafkaConsumerSpec"
+    ).asJava,
+    new StringSerializer,
+    new StringSerializer
+  )
+
+  val acquisitionTopicName = "acquisitions"
+
+  def produceAcquisition(acq: Acquisition): Future[Unit] = {
+    val record = new ProducerRecord[String, String]("acquisition", acq.id.value, acq.id.value)
+    produceRecord[String, String](producer, record).map(_ => ())
+  }
+//
+//  val produceAcquisition: Acquisition => Future[RecordMetadata] = (acquisition: Acquisition) =>
+//    produceRecord(producer, new ProducerRecord[String, String](
+//      acquisitionTopicName,
+//      acquisition.id.value,
+//      acquisition.toString)
+//    )
+
+  def produceRecord[K,V](producer: Producer[K, V], record: ProducerRecord[K, V]): Future[RecordMetadata] = {
+    val p = Promise[RecordMetadata]
+    producer.send(record, new Callback {
+      override def onCompletion(metadata: RecordMetadata, exception: Exception): Unit = {
+        Option(exception) match {
+          case Some(e) => p.failure(e)
+          case None => p.success(metadata)
+        }
+      }
+    })
+    p.future
+  }
+
   val settings: Settings = loadConfig(
     env[Option[String]]("HTTP_HOST").orElse(prop[Option[String]]("http.host")),
     env[Option[Int]]("HTTP_PORT").orElse(prop[Option[Int]]("http.port")),
-    env[Uri]("CUSTOMER_SERVICE_ENDPOINT").orElse(prop[Uri]("customer-service.endpoint")),
-    env[Uri]("ACCOUNT_SERVICE_ENDPOINT").orElse(prop[Uri]("account-service.endpoint"))
+    env[String]("KAFKA_ENDPOINT").orElse(prop[String]("kafka.endpoint"))
   )(
-    (host, port, customerServiceEndpoint, accountServiceEndpoint) =>
+    (host, port, kafkaEndpoint) =>
       Settings(host.getOrElse("0.0.0.0"),
         port.getOrElse(8081),
-        customerServiceEndpoint,
-        accountServiceEndpoint)).orThrow()
+        kafkaEndpointHC)).orThrow()
 
   implicit val system: ActorSystem = ActorSystem()
   implicit val materializer: Materializer = ActorMaterializer()
@@ -38,8 +83,7 @@ object Main extends App {
 
   val routes: Route = AcquisitionService.routes(
     new AcquisitionRepository,
-    new CustomerServiceClient(settings.customerServiceEndpoint).createCustomer,
-    new AccountServiceClient(settings.accountServiceEndpoint).createAccount
+    produceAcquisition
   )
 
   val bindingFuture = Http().bindAndHandle(routes, settings.httpHost, settings.httpPort)

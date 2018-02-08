@@ -1,6 +1,6 @@
 package com.ovoenergy.bootcamp.kafka.service.acquisition
 
-import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.{ConcurrentHashMap}
 
 import akka.http.scaladsl.model.ContentTypes.`text/plain(UTF-8)`
 import akka.http.scaladsl.model.{HttpEntity, StatusCodes}
@@ -8,10 +8,12 @@ import akka.http.scaladsl.server.{Directives, PathMatcher1, Route}
 import buildinfo.BuildInfo
 import com.ovoenergy.bootcamp.kafka.common.serde._
 import com.ovoenergy.bootcamp.kafka.domain.Acquisition.AcquisitionId
-import com.ovoenergy.bootcamp.kafka.domain._
+import com.ovoenergy.bootcamp.kafka.domain.{CreateAcquisition, _}
 import de.heikoseeberger.akkahttpcirce.ErrorAccumulatingCirceSupport
 import io.circe.syntax._
 import io.circe.{Encoder, Json}
+import org.apache.kafka.clients.producer.RecordMetadata
+
 import scala.collection.JavaConverters._
 import scala.concurrent.Future
 
@@ -33,8 +35,7 @@ object AcquisitionService
   }
 
   def routes(acquisitionRepository: AcquisitionRepository,
-             createCustomer: CreateCustomer => Future[Customer],
-             createAccount: CreateAccount => Future[Account]): Route = {
+             produceAcquisition: Acquisition => Future[Unit]): Route = {
     extractMaterializer { implicit m =>
       extractActorSystem { implicit s =>
         extractExecutionContext { implicit e =>
@@ -53,26 +54,13 @@ object AcquisitionService
                     (post & entity(as[CreateAcquisition])) {
                       createAcquisition: CreateAcquisition =>
                         val acquisitionId = AcquisitionId.unique()
-                        val acquisitionFuture = for {
-                          _ <- createCustomer(
-                            CreateCustomer(
-                              acquisitionId,
-                              createAcquisition.customerName,
-                              createAcquisition.customerEmailAddress))
-                          _ <- createAccount(
-                            CreateAccount(acquisitionId,
-                                          createAcquisition.tariff,
-                                          createAcquisition.domicileAddress,
-                                          createAcquisition.billingAddress))
+                        val acquisition: Acquisition = createAcquisition.toAcquisition(acquisitionId)
 
-                        } yield createAcquisition.toAcquisition(acquisitionId)
 
-                        val response = acquisitionFuture.map { acquisition =>
+                        complete(produceAcquisition(acquisition).map{_ =>
                           acquisitionRepository.put(acquisitionId, acquisition)
-                          StatusCodes.Created -> acquisition
-                        }
-
-                        complete(response)
+                          acquisition
+                        })
                     }
                 } ~
                   (path(acquisitionIdMatcher) & get) { acquisitionId =>
